@@ -1,0 +1,770 @@
+---
+title: ''
+author: ''
+date: ''
+output:
+  word_document:
+    reference_docx: TPU_report_template_2019.docx
+  pdf_document: default
+  html_document:
+    df_print: paged
+params:
+  proj_id: NULL
+  Exp_Name: NULL
+  sample_info: NULL
+---
+  
+```{r r_setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, include=FALSE, warning=FALSE, message=FALSE,
+  fig.align = 'center',
+  out.width="85%",
+  eval.after='fig.height'
+)
+```
+```{r experiment_setup}
+projid <- unlist(params[['proj_id']])
+Exp_Name <- unlist(params[['Exp_Name']])
+gp_names <- unlist(strsplit(Exp_Name, "_vs_"))
+gp_names
+control_gp <- gp_names[2]
+treated_gp <- gp_names[1]
+Exp_Name <- paste(treated_gp, control_gp, sep = "_vs_")
+output_dir <- file.path("..","Reports",Exp_Name)
+dir.create(output_dir)
+```
+
+
+# `r projid` RNASeq Analysis Report
+## `r stringr::str_replace_all(Exp_Name,'_',' ')`
+## `r Sys.Date()`
+## analysis: Pradeep Ramagiri
+
+<br><br><br><br>
+
+```{r load_packages}
+#LOAD PACKAGES
+library('DESeq2')
+library('GenomicRanges')
+library('GenomeInfoDb')
+library('Rcpp')
+library('RcppArmadillo')
+library("Biobase")
+library("vsn")
+library("RColorBrewer")
+library("ggplot2")
+library("openxlsx")
+library("ggrepel")
+library("grid")
+library("gridExtra")
+library("plotly")
+library("genefilter")
+library("pheatmap")
+library("reshape2")
+library("knitr")
+require('gdata')
+library('fgsea')
+library('tidyverse')
+library('DT')
+library('org.Hs.eg.db')
+library('msigdbr')
+library('org.Mm.eg.db')
+library('data.table')
+library('pkgmaker')
+library('rjson')
+library('parallel')
+library('doParallel')
+#library('ReporteRs') Decomissioned and relaunced as "Officer"
+#install.packages("officer")
+#devtools::install_github("davidgohel/officer")
+library('officer')
+library('flextable')
+library('superSeq')
+library('subSeq')
+
+
+#-------------------------------------------------------------------------------
+# Colour defines
+#-------------------------------------------------------------------------------
+# ICR palette
+icr_green                 <- "#C9DD03" # green
+icr_yellow                <- "#FFD602" # yellow
+icr_orange                <- "#F9A100" # orange
+icr_pink                  <- "#EE7EA6" # pink
+icr_red                   <- "#A71930" # red
+icr_grey                  <- "#CCCCCC" # grey
+icr_olive                 <- "#726E20" # olive
+icr_damson                <- "#6E273D" # damson
+icr_brightred             <- "#F00034" # brightred
+icr_lightgrey             <- "#ADAFAF" # lightgrey
+icr_blue                  <- "#003D4C" # blue
+
+# ggplot theme
+theme_set(theme_minimal())
+theme_replace(
+  panel.grid=element_line(colour=NA),
+  panel.border=element_rect(colour='black',fill=NA),
+  #strip.background=element_rect(fill=NA),
+  #strip.text=element_text(colour='black'),
+  axis.ticks=element_line(colour='black')
+)
+
+#-------------------------------------------------------------------------------
+# other defines
+#-------------------------------------------------------------------------------
+SPACER_TEXT               <- ''
+TABLE_FONT_SIZE           <- 7
+KEY_TABLE_FONT_SIZE       <- 7
+PAGE_HEIGHT               <- 10
+wrapper <- function(x, ...) {
+  paste(strwrap(x, ...), collapse = "\n")
+}
+
+```
+
+
+### 1. SAMPLE INFORMATION
+
+```{r read_data, include=TRUE, results='asis'}
+# Read Data
+# directory<-getwd() # use absolute paths instead!
+data <- params[['sample_info']]
+fwrite(data, file.path('..',sprintf('%s.csv',Exp_Name)))
+# data <- fread(file.path('..',sprintf('%s.csv',Exp_Name)))
+sampleFiles=data$sampleFiles
+sampleNames=data$sampleNames
+sampleConditions=data$sampleConditions
+sampleTable<-data.frame(sampleName=sampleNames, 
+                        fileName=sampleFiles, 
+                        condition=sampleConditions)
+flexSampleTable <- sampleTable %>% 
+  mutate(fileName=basename(sampleFiles)) %>%
+  flextable() %>% 
+  #flextable::autofit(., add_w=0.1) %>%
+  flextable::width(., width=c(1.25,3.5,1.25)) %>%
+  flextable::set_header_labels(., sampleName='Sample Name', fileName='File Name', condition='Condition') %>%
+  flextable::bold(., part='header') %>%
+  flextable::bg(., bg=icr_green, part='header') %>%
+  flextable::align(., align = 'center', part = 'all')
+flexSampleTable
+```
+
+<br><br><br><br>
+
+### 2. DIFFERENTIAL GENE EXPRESSION
+
+```{r generate_dds_object, pre-filtering, include=FALSE, warning=FALSE}
+ddsHTSeq<-DESeqDataSetFromHTSeqCount(sampleTable=sampleTable, 
+                                     directory="", 
+                                     design=~condition)
+colData(ddsHTSeq)$condition<-factor(colData(ddsHTSeq)$condition, levels(sampleTable$condition))
+
+# adjust the base level, otherwise it is selected alphabatically
+colData(ddsHTSeq)$condition <- relevel(colData(ddsHTSeq)$condition, ref=control_gp)
+
+# create dds counts object
+dds<-DESeq(ddsHTSeq)
+print("Total genes (raw dds): ")
+nrow(dds)
+
+#---------------------------------------
+# pre-filtering and normalisation
+#---------------------------------------
+dds_raw=counts(dds)
+dds_norm=counts(dds,normalized=TRUE)
+dds_nozero_norm<- dds_norm[rowSums(dds_norm)>1,]
+write.csv(as.data.frame(dds_nozero_norm),file=file.path(output_dir, paste(Exp_Name,"_normalised_counts_nozero.csv",sep="")))
+
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+```
+
+```{r rlog_transform, include=FALSE, warning=FALSE}
+rld <- rlogTransformation(dds, blind=FALSE)
+vsd <- varianceStabilizingTransformation(dds, blind=FALSE)
+```
+
+```{r exploratory_plots, include=FALSE}
+png(file.path(output_dir, paste(Exp_Name,"_meanSdPlot.png",sep="")))
+par(mfrow=c(1,3))
+notAllZero <- (rowSums(counts(dds))>0)
+meanSdPlot(log2(counts(dds,normalized=TRUE)[notAllZero,] + 1), ylim = c(0,2.5))
+meanSdPlot(assay(rld[notAllZero,]), ylim = c(0,2.5))
+meanSdPlot(assay(rld[notAllZero,]), ylim = c(0,2.5))
+invisible(dev.off())
+```
+
+In order to carry out the expression comparison, the raw count data for `r control_gp` and `r treated_gp` treated samples was first normalised to correct for library size and RNA composition bias. Next we divided the samples into two condition groups, `r control_gp` and `r treated_gp`. The `r control_gp` group was used as a baseline to calculate the differentially expressed genes between the two groups. Differential expression analysis was performed in R using the Bioconductor package DESeq2. The result tables generated using the DESeq2 package consist of 7 primary columns:
+
+<br><br><br><br>
+
+```{r table2, include=TRUE, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+Column_name <- c('Gene symbol','baseMean','Log2FoldChange','lfcSE','stat','pvalue','padj')
+Description <- c('Gene symbol','Average of the normalized count values, divided by size factors, taken over all samples', 'Effect size estimate (control group vs treated group), reported in a logarithmic scale to base 2', 'The standard error estimate for the log2 fold change estimate','Wald statistics','Wald test p-value','Benjamini-Hochberg adjusted p-values')
+de_descript <- data.frame(Column_name, Description)
+flex_de_descript <- de_descript %>% 
+  #mutate(fileName=basename(sampleFiles)) %>%
+  flextable() %>% 
+  flextable::width(., width=c(1.6,4.4)) %>%
+  flextable::set_header_labels(., Column_name='Column name') %>%
+  flextable::bold(., part='header') %>%
+  flextable::bg(., bg=icr_yellow, part='header') %>%
+  flextable::align(., align='left', part='all')
+flex_de_descript
+```
+
+#####
+
+```{r DE gene analysis, include=FALSE, warning=FALSE}
+#----------------------------------------
+# Differential gene expression results
+#----------------------------------------
+res<-results(dds)
+res_ed=na.omit(res)
+res_ed<-res_ed[order(res_ed$padj),]
+summary(res)
+summary(res_ed)
+mcols(res,use.names=TRUE)
+write.csv(as.data.frame(res),file=file.path(output_dir, paste(Exp_Name,"_results_raw.csv",sep="")))
+mcols(res_ed,use.names=TRUE)
+write.csv(as.data.frame(res_ed),file=file.path(output_dir, paste(Exp_Name,"_results_filtered.csv",sep="")))
+
+# All genes with adjusted pvalue less than equal to 0.05 (i.e 5% false discovery rate)
+sum( res_ed$padj <= 0.05, na.rm=TRUE )
+# Filter up and down regulated genes on the basis of adjusted pvalue
+resSig <- res_ed[ which(res_ed$padj <= 0.05 ), ]
+resSig<-na.omit(resSig)
+#down <-head( resSig[ order( resSig$log2FoldChange ), ],n=200L )
+down=resSig[ which(resSig$log2FoldChange <= -1), ]
+up=resSig[ which(resSig$log2FoldChange >= 1), ]
+write.csv(resSig,file=file.path(output_dir, paste(Exp_Name,"_results_significant_0.05.csv",sep="")))
+write.csv(down,file=file.path(output_dir, paste(Exp_Name,"_down_regulated_genes_0.05.csv",sep="")))
+write.csv(up,file=file.path(output_dir, paste(Exp_Name,"_up_regulated_genes_0.05.csv",sep="")))
+```
+
+```{r pvalue histogram, fig.show='true', include=FALSE}
+## plot histogram of pvalues and padjust
+png(file.path(output_dir, paste(Exp_Name,"_histogram_pvalue_resSig.png",sep="")))
+par(mfrow=c(1,2))
+hist(x=res_ed$pvalue, xlab = "p-values", main = "Histogram of pvalues")
+hist(x=res_ed$padj, xlab = "adjusted p-values", main = "Histogram of adjusted pvalues")
+invisible(dev.off())
+#knitr::include_graphics(paste(Exp_Name,"_histogram_pvalue_resSig.png",sep=""))
+```
+
+By subsampling sequencing reads and calculating number of DEGs detected at various depth, we can model a relationship between sequencing depth and statistical power to see if experiment is saturated. For this we use SuperSeq package (github.com/StoreyLab/superSeq).
+
+```{r include=TRUE, echo=FALSE, warning=FALSE}
+#fit model and make predictions
+dds_proportions <- 10 ^ seq(-2, 0, 0.1)
+ss = subsample(counts = counts(dds)[rowSums(counts(dds))>1,],
+               proportions = dds_proportions,
+               treatment = colData(ddsHTSeq)$condition, 
+               method = c("voomLimma"),
+               replications = 3,
+               seed = 12345)
+ss_sum <- summary(ss)
+ss_obj <- superSeq(ss_sum)
+# tidy data
+superseq_fit <- as.data.table(ss_obj$subsample)[,.(depth,proportion,replication,significant)]
+# exp_depth <- superseq_fit[proportion==1]$depth 
+# depth overestimated from feature counts! use mapping stats instead
+qc_statistics_file <- list.files(path='..',pattern='.*RNAseq_QC_summary_metrics.csv', full.names=TRUE)
+PE <- TRUE
+qc_statistics <- fread(qc_statistics_file, select=c('SAMPLES','TOTAL_READS_OR_PAIRS'))[,Sample_ID:=str_replace(SAMPLES,'Sample(_)*','')]
+# calculate median coverage for samples in this experiment (comparison)
+exp_depth <- median(qc_statistics[Sample_ID %in% data$Sample_ID,TOTAL_READS_OR_PAIRS])
+if (PE==TRUE) exp_depth=2*exp_depth
+superseq_fit[,depth:=proportion*exp_depth]
+superseq_predict <- as.data.table(ss_obj$predictions)[,':='(depth=proportion*exp_depth, replication=1,significant=predicted)][,.(depth,proportion,replication,significant)]
+superseq_DT <- rbindlist(list(fit=superseq_fit,predict=superseq_predict),idcol='type')
+# plot
+superseq_plot <- file.path(output_dir, paste(Exp_Name,"_sequencing_saturation_plot.png",sep=""))
+png(superseq_plot, height = 5, width = 7, units = "in", res = 300)
+ggplot()  +
+  geom_line(data=superseq_DT[type=='predict'], aes(depth/1e6, significant), size=1, color=icr_red) +
+  geom_point(data=superseq_DT[type=='fit'], aes(depth/1e6, significant), size=1, color=icr_blue) +
+  geom_vline(aes(xintercept = exp_depth/1e6), lty=3) +
+  labs(x='sequencing depth / millions', y='DEGs') 
+invisible(dev.off())
+knitr::include_graphics(superseq_plot)
+```
+
+**Figure 1.** Modeled relationship between the sequencing depth and statistical power of the experiment. Number of DEGs detected at various sequencing depths obtained by subsampling original data (blue points on the plot) is used to build a model (red line) that predicts how increase in the sequencing depth would affect the number of DEGs. Dashed line indicates the median read depth of the experiment.  
+<br><br><br><br>
+
+We generated heatmaps for the top 100 differentially regulated genes with the lowest adjusted p-value. The heatmap shows blocks of genes that covary across samples (Figure 1). The dendrogram at the top shows the hierarchical clustering of the samples and the dendrogram on the side shows the hierarchical clustering of the genes.
+
+<br><br><br><br>
+
+```{r DE_heatmap, include=TRUE, echo=FALSE, warning=FALSE, fig.height=8, out.width="50%"}
+# Heatmap of differentially expressed genes
+num_genes <- 20
+de <- rownames(resSig)
+de_mat <- assay(rld)[de,]
+de_mat=de_mat[1:num_genes,]
+mat <- de_mat - rowMeans(de_mat)
+df_de <- as.data.frame(colData(rld)[,c("condition")])
+rownames(df_de)<-rownames(colData(rld))
+colnames(df_de)<-"condition"
+pheatmap(mat,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdYlBu")))(num_genes),
+         fontsize_row=5,fontsize_col=8, border_color=NA, treeheight_col = 25,
+         main=paste(Exp_Name,sprintf("- Heatmap of top %s Differentially expressed genes", num_genes)),fontsize=6,
+         annotation=df_de,
+         filename=file.path(output_dir, paste(Exp_Name,sprintf("_DEsig_top%s_heatmaps.png", num_genes),sep="")),
+         height = 8, width = 6
+)
+knitr::include_graphics(file.path(output_dir, paste(Exp_Name,sprintf("_DEsig_top%s_heatmaps.png", num_genes),sep="")))
+```
+
+**Figure 2.** Heatmap showing the expression data of the `num_genes` differentially regulated genes across samples for the `r control_gp` and `r treated_gp` groups (the data has been rlog transformed).
+
+<br><br><br><br>
+
+We filtered the significant up-regulated and down-regulated genes with pvalue =< 0.05 and padj =< 0.05. The raw counts, normalised counts, results for differential expression analysis and the filtered significant DE results can be found in the separate excel spreadsheets.  
+
+Excel Workbook for raw counts data and normalised count data: `r sprintf("%s_counts.xlsx", Exp_Name)`  
+
+* Sheet 1: Raw counts for all the samples  
+
+* Sheet 2: Filtered normalised counts for all the samples and for the genes with sum of counts over all samples > 0  
+
+Excel Workbook for DE analysis results: `r sprintf("%s_DE_results.xlsx", Exp_Name)`  
+
+* Sheet 1: statistically significant up-regulated genes with log2fold change of >= 1 (sorted by fold change)  
+
+* Sheet 2: statistically significant down-regulated genes with log2fold change of <= -1 (sorted by fold change)  
+
+* Sheet 3: Statistically significant differentially expressed (DE) genes (pvalue =< 0.05 and padj =< 0.05) including normalised counts for each sample (rounded values)  
+
+* Sheet 4: Differential expression analysis results (raw) including normalised counts for each sample (rounded values)  
+
+
+<br><br><br><br>
+<br><br><br><br>
+
+
+```{r output_spreadsheets, echo=FALSE, warning=FALSE, include=FALSE}
+#---------------------------------------
+#create tables
+#---------------------------------------
+library("openxlsx")
+Exp_Name
+##create spreadsheet for counts data
+norm=as.data.frame(round(dds_nozero_norm,digits=2))
+temp<-as.data.frame(rownames(norm))
+colnames(temp)=c("gene_symbol")
+norm=cbind(temp,norm)
+temp<-NULL
+
+raw=as.data.frame(dds_raw)
+temp<-as.data.frame(rownames(raw))
+colnames(temp)=c("gene_symbol")
+raw=cbind(temp,raw)
+temp<-NULL
+
+data_list=list("_raw_counts"=raw, "_normalised_counts_nozero"=norm)
+names(data_list) <- paste0(Exp_Name, names(data_list))
+write.xlsx(data_list, file = file.path(output_dir, paste0(Exp_Name,"_counts.xlsx")), sep="", rownames=TRUE,colNames = TRUE, borders = "surrounding")
+
+##create spreadsheet for expression data
+raw_DE=as.data.frame(res)
+temp<-as.data.frame(rownames(raw_DE))
+colnames(temp)=c("gene_symbol")
+raw_DE=cbind(temp,raw_DE)
+temp<-NULL
+norm_data=round(norm[,2:7],digits=0)
+temp1<-as.data.frame(rownames(norm_data))
+colnames(temp1)=c("gene_symbol")
+norm_data=cbind(temp1,norm_data)
+temp1<-NULL
+merge_raw<- merge(raw_DE, norm_data, by=c("gene_symbol"), sort=FALSE)
+colnames(merge_raw)[8:13] <- paste(colnames(merge_raw[,c(8:13)]), "norm_counts", sep = "_")
+
+
+sig_DE=as.data.frame(resSig)
+temp<-as.data.frame(rownames(sig_DE))
+colnames(temp)=c("gene_symbol")
+sig_DE=cbind(temp,sig_DE)
+temp<-NULL
+norm_data=round(norm[,2:7],digits=0)
+temp1<-as.data.frame(rownames(norm_data))
+colnames(temp1)=c("gene_symbol")
+norm_data=cbind(temp1,norm_data)
+temp1<-NULL
+merge_sig<- merge(sig_DE, norm_data, by=c("gene_symbol"), sort=FALSE)
+colnames(merge_sig)[8:13] <- paste(colnames(merge_sig[,c(8:13)]), "norm_counts", sep = "_")
+
+
+up_DE=as.data.frame(up)
+temp<-as.data.frame(rownames(up_DE))
+colnames(temp)=c("gene_symbol")
+up_DE=cbind(temp,up_DE)
+temp<-NULL
+
+down_DE=as.data.frame(down)
+temp<-as.data.frame(rownames(down_DE))
+colnames(temp)=c("gene_symbol")
+down_DE=cbind(temp,down_DE)
+temp<-NULL
+
+data_list=list("_upregulated"=up_DE, "_downregulated"=down_DE, "_DEsig_coding"=merge_sig, "_DE_raw"=merge_raw)
+names(data_list) <- paste0(Exp_Name, names(data_list))
+write.xlsx(data_list, file = file.path(output_dir, paste0(Exp_Name,"_DE_results.xlsx")), sep="", rownames=TRUE,colNames = TRUE, borders = "surrounding")
+```
+
+### 3. GENE SET ENRICHMENT ANALYSIS
+
+```{r echo=FALSE, include=FALSE}
+#---------------------------------------
+#Pathway analysis using fgsea
+#---------------------------------------
+res_raw<-results(dds)
+res_ed=na.omit(res_raw)
+res_ed<-res_ed[order(res_ed$padj),]
+summary(res_ed)
+mcols(res_ed,use.names=TRUE)
+
+
+##all genes with adjusted pvalue less than equal to 0.05(i.e 5% false discovery rate)
+sum( res_ed$padj <= 0.05, na.rm=TRUE )
+# Filter up and down regulated genes on the basis of adjusted pvalue
+#resSig <- res_ed[ which(res_ed$padj <= 0.05 ), ]
+
+
+### FGSEA
+
+res <- as.data.table(res_ed)
+res[,SYMBOL:=rownames(res_ed)]
+setcolorder(res, "SYMBOL")
+colnames(res)
+res <- res[pvalue==0,pvalue:=pvalue+min(res$pvalue[res$pvalue>0])]
+
+
+# Generate 'ranks'
+res$fcSign=sign(res$log2FoldChange)
+res$logP=-log10(res$pvalue) # small pval => high -log10(pval)
+res$stat=res$logP/res$fcSign # ranking based on p value only
+#res$rank=res$fcSign*res$log2FoldChange*res$stat # include lfc in ranking
+
+res2 <- res %>% 
+  dplyr::select(SYMBOL, stat) %>% 
+  na.omit() %>% 
+  distinct() %>% 
+  group_by(SYMBOL) %>% 
+  summarize(stat=mean(stat))
+
+ranks <- deframe(res2)
+```
+
+With the ranked list of differentially expressed genes as an input, we performed gene set enrichment analysis (GSEA) in R using the Bioconductor package fgsea. We used hallmark gene sets from the Molecular Signatures Database (MSigDB), which represent specific well-defined biological states or processes and display coherent gene expression within the set.  
+
+#### Hallmark gene sets
+
+```{r include=TRUE, dpi=72, fig.width=10, out.width="100%"}
+
+# Load the pathways into a named list
+
+# "H" for Hallmark pathways  from MsigDB  
+
+#getPathways <- function(species="Mus musculus",category=NULL,subcategory=NULL)
+getPathways <- function(species="Homo sapiens",category=NULL,subcategory=NULL)  
+{
+  m_df <- msigdbr(species=species, category=category, subcategory=subcategory)
+  m_list <- split(setDT(m_df), by="gs_name")
+  sapply(m_list, function(x) x$gene_symbol, USE.NAMES=TRUE, simplify=FALSE)
+}
+
+# "C2" for Curated pathways  from MsigDB  
+#pathways.hallmark <- getPathways(category="C2")
+
+# "H" for Hallmark pathways  from MsigDB  
+pathways.hallmark <- getPathways(category="H")
+
+#pathways.hallmark.gmt <- gmtPathways(file.path(resources_dir,path_h))
+
+# inspect the difference between msigdbr and gmt file pathways
+#Test<-all.equal(pathways.hallmark, sapply(pathways.hallmark.gmt[names(pathways.hallmark)], sort, USE.NAMES=TRUE, simplify=FALSE))
+#head(Test)
+
+
+names(pathways.hallmark) <- str_extract(names(pathways.hallmark), "(?<=HALLMARK_).*") %>%
+  str_replace_all(pattern="_", replacement=" ")
+
+fgseaRes <- fgsea(pathways=pathways.hallmark, stats=ranks, minSize=20, maxSize=500, nperm=10000)
+
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval)), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval)), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plot_height <- length(topPathways)/4
+if (plot_height > PAGE_HEIGHT) 
+  plot_height <- PAGE_HEIGHT 
+gsea_table_plot <- file.path(output_dir, paste(Exp_Name,"_gsea_table_plot.png",sep=""))
+png(gsea_table_plot, height = plot_height, width = 8, units = "in", res = 300)
+plotGseaTable(pathways.hallmark[topPathways], ranks, fgseaRes, gseaParam = 0.5)
+invisible(dev.off())
+knitr::include_graphics(gsea_table_plot)
+```
+
+
+**Figure 3.** Top enriched pathways.
+List of most-significantly enriched pathways. The genes were ranked according to their differential expression significance (pvalue) and fold change (including the sign value), with the most significantly up-regulated genes at the top and down-regulated genes at the bottom of the list, the enriched gene sets provides us with some idea of the function of these genes.
+
+<br><br><br><br>
+<br><br><br><br>
+
+```{r pathway_plot_data}
+# Order by pvalue
+fgseaRes <- (fgseaRes[order(padj), ])
+
+# Order by NES
+#fgseaRes <- (fgseaRes[order(NES), ])
+#Percent_NES <- 0.25
+#Quant_NES <- quantile(fgseaRes$NES, probs=c(Percent_NES/2,1-Percent_NES/2))
+#fgseaRes %>% filter(NES<=Quant_NES[1] | NES>=Quant_NES[2])
+
+ # Show in a nice table:
+fgseaRes %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  arrange(padj) %>% 
+  #DT::datatable() # html
+  kable() # word
+
+fwrite(fgseaRes, file=file.path(output_dir,"fgseaRes_raw.xls"), sep="\t", sep2=c("", " ", ""))
+
+# Filter and retain pathways with padj<0.05
+fgseaRes <-fgseaRes %>% filter(padj<0.05)
+
+
+fgseaResTidy <- fgseaRes %>% as_tibble() %>% arrange(desc(NES))
+if (nrow(fgseaRes) < 5) {
+  plot_height <- nrow(fgseaRes)/3
+} else { 
+  plot_height <- nrow(fgseaRes)/4
+}
+if (plot_height > PAGE_HEIGHT) 
+  plot_height <- PAGE_HEIGHT 
+```
+```{r pathway_plot, include=TRUE}
+pathways_barplot <- file.path(output_dir, paste(Exp_Name,"_pathways_barplot.png",sep=""))
+#png(pathways_barplot, height = plot_height, width = 6, units = "in", res = 300)
+ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=padj<0.05)) + guides(fill=FALSE) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+invisible(dev.off())
+knitr::include_graphics(pathways_barplot)
+```
+
+<br><br><br><br>
+
+**Figure 4.** Pathways enrichment plot, padj<0.05.
+
+<br><br><br><br>
+<br><br><br><br>
+
+```{r pathway_table}
+
+# Format pvalues to 
+
+# format.pval(fgseaResTidy$padj,
+             
+             # digits : number of digits, but after the 0.0
+#            digits = 3,
+             # eps = the threshold value above wich the 
+             # function will replace the pvalue by "<0.0xxx"
+ #           eps = 0.001,
+             # nsmall = how much tails 0 to keep if digits of 
+             # original value < to digits defined
+#            nsmall = 3,
+            
+#            ifelse(pvalues < 0.05, "*", ""))
+  
+
+          
+ # Show in a nice table:
+fgseaResTidy %>% 
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+  arrange(padj) %>% 
+  #DT::datatable() # html
+  kable() # word
+
+fwrite(fgseaResTidy, file=file.path(output_dir,"fgseaRes_padj<0.05.xls"), sep="\t", sep2=c("", " ", ""))
+
+#pathways.hallmark %>% 
+#  enframe("pathway", "SYMBOL") %>% 
+#  unnest() %>% 
+#  inner_join(res, by="SYMBOL") %>%
+#  #DT::datatable(options=list(scrollX=TRUE)) # html
+#  kable() # word
+```
+```{r pathway_enrich_plot_data}
+plotenr_list <- lapply(fgseaResTidy$pathway, function(x) 
+  plotEnrichment(pathways.hallmark[[x]], ranks) + 
+    labs(title=wrapper(x,width=20)) + theme(
+      plot.title = element_text(size=5, face='bold'),
+      axis.title = element_blank(),
+      axis.text = element_text(size=5)
+    )
+)
+plot_height <- ceiling(length(plotenr_list)/4)*1.4
+if (plot_height > PAGE_HEIGHT) 
+  plot_height <- PAGE_HEIGHT 
+```
+```{r pathway_enrich_plot, include=TRUE, fig.height=plot_height}
+pathway_enrich_grid <- file.path(output_dir, paste(Exp_Name,"_pathways_plot.png",sep=""))
+png(pathway_enrich_grid, height = plot_height, width = 6, units = "in", res = 300)
+grid.arrange(
+  arrangeGrob(
+    grobs=plotenr_list,
+    left=textGrob("enrichment score", gp=gpar(fontsize=7), rot=90, vjust=1),
+    bottom=textGrob("rank", hjust=1, gp=gpar(fontsize=7)),
+    ncol=4
+  )
+)
+invisible(dev.off())
+knitr::include_graphics(pathway_enrich_grid)
+```
+
+**Figure 5.** Enrichment plots for individual pathways.
+<br><br><br><br>
+Graph(s) that corresponds to a calculation of GSEA statistic. Each breakpoint on a graph corresponds to a gene present in the pathway. Dotted line cross at a point which is the farthest up from a diagonal (dashed line). This point correspond to gene i+, where the maximal value of Enrichment Score(ES) is reached. The x-axis shows the ranked list of genes and the vertical bars on the x-axis show the genes that belong to the respective pathway set and the y-axis shows the enrichment score.
+
+#####
+
+### 4. DIAGNOSTIC PLOTS
+
+#### Density plots
+
+Density plot per condition (log2 transformed values with pseudocount). Density plots of log-intensity distribution of each library can be superposed on a single graph for a better comparison between libraries and for identification of libraries with weird distribution. 
+On the boxplots the density distributions of raw log-intensities are not expected to be identical but still not totally different.
+
+
+```{r Density_plot, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE}
+pseudoCount = log2(dds_norm+1)
+df = melt(pseudoCount)
+colnames(df)=c("GeneSymbol","sampleNames","value")
+df$condition = sampleTable[match(df$sampleNames, sampleTable$sampleName),"condition"] 
+
+density_plot <- file.path(file.path(output_dir, paste(Exp_Name,"_density_plot.png",sep="")))
+png(density_plot, height = 5, width = 6, units = "in", res = 300)
+ggplot(df, aes(x = value, colour = sampleNames, fill = sampleNames)) + ylim(c(0, 0.25)) +
+  geom_density(alpha = 0.2, size = 1) + facet_grid(condition ~ .) + labs(fill = 'Sample', colour = 'Sample') +
+  theme(legend.position = "top") + xlab(expression("log2 normalised data"))
+invisible(dev.off())
+knitr::include_graphics(density_plot)
+```
+
+**Figure 6.** Density plots for the samples within each condition
+
+```{r normalised_boxplots, include=FALSE}
+##boxplot log2 normalised counts
+ggplot(df, aes(x = sampleNames, y = value, fill = condition)) + geom_boxplot() + xlab("") +
+  ylab("log2 normalised counts") 
+ggsave(file.path(output_dir, paste(Exp_Name,"_boxplot_log2_norm.png",sep="")))
+
+##boxplot rld
+df_rld = melt(assay(rld))
+colnames(df_rld)=c("GeneSymbol","sampleNames","rld")
+df_rld$condition = sampleTable[match(df_rld$sampleNames, sampleTable$sampleName),"condition"] 
+ggplot(df_rld, aes(x = sampleNames, y = rld, fill = condition)) + geom_boxplot() + xlab("") +
+  ylab("boxplot rld")
+ggsave(file.path(output_dir, paste(Exp_Name,"_boxplot_rld.png",sep="")))
+
+##boxplot vsd
+df_vsd = melt(assay(vsd))
+colnames(df_vsd)=c("GeneSymbol","sampleNames","vsd")
+df_vsd$condition = sampleTable[match(df_vsd$sampleNames, sampleTable$sampleName),"condition"] 
+ggplot(df_vsd, aes(x = sampleNames, y = vsd, fill = condition)) + geom_boxplot() + xlab("") +
+  ylab("boxplot vsd")
+ggsave(file.path(output_dir, paste(Exp_Name,"_boxplot_vsd.png",sep="")))
+```
+
+#####
+
+#### MA plot
+
+A diagnostic MA plot was generated to provide an overview of the comparison. The plot shows the shrinkage of log2 fold changes resulting from the incorporation of a zero-centred normal prior. The shrinkage is greater for the log2 fold change estimates from genes with low counts and high dispersion (Figure 3).
+
+```{r MA_plot, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE, cache=FALSE}
+ma_plot <- file.path(output_dir, paste(Exp_Name,"_MAplot.png",sep=""))
+png(ma_plot, height = 6, width = 7, units = "in", res = 300)
+plotMA(dds,ylim=c(-7,7),main=paste(Exp_Name," MA PLOT",sep=""))
+invisible(dev.off())
+knitr::include_graphics(ma_plot)
+```
+
+**Figure 7.** MA-plot. The plots show the log2 fold changes over the mean of normalized counts, i.e. the average of counts normalized by size factors. The plot represents each gene with a dot. The x axis is the average expression over all samples and the y axis is the log2 fold change between the condition groups. DE genes with significant padj value are shown in red. 
+
+#####
+
+#### Sample by Sample clustering
+
+To assess the overall similarity between samples, we used the transformed data for sample clustering
+
+```{r samplebysample clustering, include=TRUE, echo=FALSE, warning=FALSE, message=F, cache=FALSE, out.width="50%"}
+sampleDists <- dist( t(assay(rld)))
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- with(colData(dds),sprintf("%s (%s)",sampleNames,sampleConditions))
+colnames(sampleDistMatrix) <- with(colData(dds),paste(sampleNames))
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues"))) (255)
+heatmap_plot <- file.path(output_dir, paste(Exp_Name,"_heatmaps_samplebysample_complete_pheatmap.png",sep=""))
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors,
+         filename=heatmap_plot)
+knitr::include_graphics(heatmap_plot)
+```
+
+**Figure 8.** Sample-to-sample distances. Heatmap showing the Euclidean distances between the samples as calculated from the regularized log transformation.
+
+#####
+
+#### PCA plot
+
+We further visualized the sample-to-sample distance with principal-components analysis (PCA). The two condition groups are coloured differently
+
+```{r PCA_plot, include=TRUE, echo=FALSE, warning=FALSE, message=FALSE, cache=FALSE}
+Pvars <- rowVars(assay(rld))
+select <- order(Pvars, decreasing = TRUE)[seq_len(min(length(Pvars)))]
+PCA <- prcomp(t(assay(rld)[select, ]), scale = F)
+percentVar <- round(100*PCA$sdev^2/sum(PCA$sdev^2),1)
+dataGG = data.frame(PC1 = PCA$x[,1], PC2 = PCA$x[,2], 
+                    PC3 = PCA$x[,3], PC4 = PCA$x[,4], 
+                    sampleNO = sampleNames,
+                    condition = colData(rld)$condition)
+
+pca_plot <- file.path(output_dir, paste(Exp_Name,"_PCA.png",sep=""))
+png(pca_plot, height = 5, width = 6, units = "in", res = 300)
+qplot(PC1, PC2, data = dataGG, color =  condition, main = "PC1 vs PC2", size = I(3)) + 
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  labs(
+    x = paste0("PC1, % variance: ", round(percentVar[1],4)),
+    y = paste0("PC2, % variance: ", round(percentVar[2],4))) + 
+  scale_colour_brewer(type="qual", palette=2) +
+  geom_point(size = 1) +
+  geom_text(
+    aes(label=sampleNames),size=3,hjust=1.2,
+    check_overlap=FALSE,
+    nudge_x=0.2*(max(dataGG$PC1) + abs(min(dataGG$PC1))),
+    nudge_y=0.02*(max(dataGG$PC2) + abs(min(dataGG$PC2)))
+  )
+invisible(dev.off())
+knitr::include_graphics(pca_plot)
+```
+
+**Figure 9.** PCA plot. The six samples shown in the 2D plane spanned by their first two principal components. This type of plot is useful for visualizing the overall effect of experimental covariates and batch effects.
+
+```{r scree_plots, fig.show='true', include=FALSE}
+##Scree_plot
+summary(PCA)
+scree_plot=data.frame(percentVar)
+scree_plot[,2]<-c(1:nrow(sampleTable))
+colnames(scree_plot)<-c("variance","component_number")
+ggplot(scree_plot, mapping=aes(x=component_number, y=variance))+geom_bar(stat="identity")
+ggsave(file.path(output_dir, paste(Exp_Name,"_scree_plot.png",sep="")))
+```
+
+
